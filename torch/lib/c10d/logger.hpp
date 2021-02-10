@@ -37,9 +37,8 @@ class Logger {
       at::cuda::CUDAEvent& gpu_end);
 #endif
   // Set stats that can be collected only during
-  // training loop. It is called at the beginning of forward call
-  // to record the run time stats of iterations previouly ran.
-  void set_runtime_stats();
+  // training loop. It is called at beginning of forward call.
+  void set_runtime_stats_and_log();
 
  private:
   // ddp_logging_data_ is used to hold all the ddp related logging
