@@ -4,7 +4,7 @@ namespace c10d {
 
 class Logger {
  public:
- explicit Logger(std::shared_ptr<c10d::Reducer> reducer);
+  explicit Logger(std::shared_ptr<c10d::Reducer> reducer);
   // Set logging data that can be got during DistributedDataParallel
   // construction time.
   void set_construction_data_and_log(
@@ -21,8 +21,25 @@ class Logger {
   void set_env_variables();
   // Set parameters stats.
   void set_parameter_stats();
-  // Set buckets related stats.
-  void set_bucket_stats();
+  // Get size of each bucket (Bytes).
+  std::vector<int> get_bucket_sizes();
+
+  // Calculate avg stats using cpu timer and gpu timer
+  // that has been recorded in reducer.
+  void calculate_avg_cpu_time(
+      int64_t& avg_time,
+      int64_t cpu_start_time,
+      int64_t cpu_end_time);
+#ifdef USE_CUDA
+  void calculate_avg_gpu_time(
+      int64_t& avg_time,
+      at::cuda::CUDAEvent& gpu_start,
+      at::cuda::CUDAEvent& gpu_end);
+#endif
+  // Set stats that can be collected only during
+  // training loop. It is called at the beginning of forward call
+  // to record the run time stats of iterations previouly ran.
+  void set_runtime_stats();
 
  private:
   // ddp_logging_data_ is used to hold all the ddp related logging

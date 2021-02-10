@@ -44,7 +44,8 @@ Reducer::Reducer(
       find_unused_parameters_(find_unused_parameters),
       gradient_as_bucket_view_(gradient_as_bucket_view),
       local_used_maps_reduced_(false),
-      backward_stats_base_(0),
+      num_iterations_(0),
+      num_buckets_ready_(0),
       has_rebuilt_bucket_(false),
       bucket_bytes_cap_(bucket_bytes_cap),
       divFactor_(kUnsetDivFactor),
@@ -566,7 +567,7 @@ void Reducer::mark_variable_ready(VariableIndex index) {
       variable_index < variable_locators_.size(),
       "Out of range variable index.");
   backward_stats_[replica_index][variable_index] =
-      current_time_in_nanos() - backward_stats_base_;
+      current_time_in_nanos() - cpu_timer_.backward_compute_start_time;
 
   // Any time we mark a variable ready (be it in line due to unused parameters,
   // or via an autograd hook), we require a call to the finalize function. If
@@ -691,6 +692,18 @@ void Reducer::mark_bucket_ready(size_t bucket_index) {
   // - found a bucket that's not yet ready for reduction.
   for (; next_bucket_ < buckets_.size() && buckets_[next_bucket_].pending == 0;
        next_bucket_++) {
+    num_buckets_ready_++;
+    if (num_buckets_ready_ == 1) {
+      if (replicas_[0][0].is_cuda()) {
+        #ifdef USE_CUDA
+        // No need to set_device() here, as autograd thread has already set
+        // it properly
+        gpu_timer_.backward_comm_start.record();
+        #endif
+      } else {
+        cpu_timer_.backward_comm_start_time = current_time_in_nanos();
+      }
+    }
     auto& bucket = buckets_[next_bucket_];
     std::vector<at::Tensor> tensors;
     tensors.reserve(bucket.replicas.size());
@@ -969,6 +982,22 @@ void Reducer::populate_bucket_views_out(
   }
 }
 
+void Reducer::prepare_for_forward() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  num_iterations_++;
+  if (replicas_[0][0].is_cuda()) {
+    #ifdef USE_CUDA
+    // Create and record event on the replicas_[0][0].device().
+    // If application is running on single process multiple devices,
+    // one event on one device is sufficient.
+    at::cuda::set_device(replicas_[0][0].device().index());
+    gpu_timer_.forward_start.record();
+    #endif
+  } else {
+    cpu_timer_.forward_start_time = current_time_in_nanos();
+  }
+}
+
 // Traverse the autograd graph starting at the specified output.
 // All parameters for which we have a pointer to their gradient accumulation
 // functions, but don't show up in the autograd graph will be marked ready for
@@ -984,7 +1013,23 @@ void Reducer::prepare_for_backward(
   // Reset accounting.
   expect_autograd_hooks_ = true;
   next_bucket_ = 0;
-  backward_stats_base_ = current_time_in_nanos();
+
+  cpu_timer_.backward_compute_start_time = current_time_in_nanos();
+
+  if (replicas_[0][0].is_cuda()) {
+    #ifdef USE_CUDA
+    // Create and record event on the replicas_[0][0].device().
+    // If application is running on single process multiple devices,
+    // one event on one device is sufficient.
+    at::cuda::set_device(replicas_[0][0].device().index());
+    gpu_timer_.backward_compute_start.record();
+    #endif
+  }
+
+  // Reset num_buckets_ready_ at the beginning of backward computation
+  // in each iteration.
+  num_buckets_ready_ = 0;
+
   for (auto& bucket : buckets_) {
     for (auto& replica : bucket.replicas) {
       replica.pending = replica.variables.size();
@@ -1176,6 +1221,16 @@ void Reducer::finalize_bucket_dense(Bucket& bucket) {
 }
 
 void Reducer::finalize_backward() {
+  if (replicas_[0][0].is_cuda()) {
+    #ifdef USE_CUDA
+    // No need to set_device() here, as autograd thread has already set
+    // it properly
+    gpu_timer_.backward_compute_end.record();
+    #endif
+  } else {
+    cpu_timer_.backward_compute_end_time = current_time_in_nanos();
+  }
+
   // No longer expect autograd hooks to fire after this function returns.
   TORCH_INTERNAL_ASSERT(expect_autograd_hooks_);
   expect_autograd_hooks_ = false;
@@ -1245,6 +1300,16 @@ void Reducer::finalize_backward() {
       local_used_work_->wait();
     }
     local_used_maps_reduced_ = false;
+  }
+
+  if (replicas_[0][0].is_cuda()) {
+    #ifdef USE_CUDA
+    // No need to set_device() here, as autograd thread has already set
+    // it properly
+    gpu_timer_.backward_comm_end.record();
+    #endif
+  } else {
+    cpu_timer_.backward_comm_end_time = current_time_in_nanos();
   }
 }
 
